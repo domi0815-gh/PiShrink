@@ -1,45 +1,79 @@
 #!/usr/bin/env bash
 
-# Project: PiShrink
-# Description: PiShrink is a bash script that automatically shrink a pi image that will then resize to the max size of the SD card on boot.
-# Link: https://github.com/Drewsif/PiShrink
+# Project: PiShrink (patched fork)
+# Description: PiShrink is a bash script that automatically shrinks a Pi image
+#              that will then resize to the max size of the SD/NVMe on boot.
+# Upstream:    https://github.com/Drewsif/PiShrink
+#
+# Patches in this version vs. upstream v0.1.x:
+#   * ZIPTOOLS array fix (was a single concatenated element)
+#   * Broken update-check condition fixed (if [[ $? ]] is always true)
+#   * return -1 -> return 1
+#   * REQUIRED_TOOLS converted to a proper bash array
+#   * set -o pipefail for early failure detection in pipelines
+#   * cleanup() now also unmounts $mountdir and removes the tmp dir
+#   * udevadm settle replaces sleep-based syncs
+#   * size readouts via stat + numfmt (no more ls -lh | cut)
+#   * grep|grep anti-pattern replaced with single awk
+#   * command -v properly quoted
+#   * zstd support (-S flag), incl. parallel mode
+#   * autoexpand rc.local now detects mmcblk*, nvme*, sd* automatically
+#   * truncate-shrink only runs if it would actually shrink
+#   * Fixed indentation in checkFilesystem
+#   * getopts now reports invalid option cleanly
 
-version="v26.03.16"
+set -o pipefail
+
+version="v0.1.5-fixes"
 startSeconds=$SECONDS
 
 CURRENT_DIR="$(pwd)"
 SCRIPTNAME="${0##*/}"
 MYNAME="${SCRIPTNAME%.*}"
 LOGFILE="${CURRENT_DIR}/${SCRIPTNAME%.*}.log"
-REQUIRED_TOOLS="parted losetup tune2fs md5sum e2fsck resize2fs"
-ZIPTOOLS=("gzip xz")
-declare -A ZIP_PARALLEL_TOOL=( [gzip]="pigz" [xz]="xz" ) # parallel zip tool to use in parallel mode
-declare -A ZIP_PARALLEL_OPTIONS=( [gzip]="-f9" [xz]="-T0" ) # options for zip tools in parallel mode
-declare -A ZIPEXTENSIONS=( [gzip]="gz" [xz]="xz" ) # extensions of zipped files
+
+REQUIRED_TOOLS=(parted losetup tune2fs md5sum e2fsck resize2fs findmnt lsblk numfmt)
+
+ZIPTOOLS=("gzip" "xz" "zstd")
+declare -A ZIP_PARALLEL_TOOL=(   [gzip]="pigz" [xz]="xz"     [zstd]="zstd"          )
+declare -A ZIP_PARALLEL_OPTIONS=([gzip]="-f9"  [xz]="-T0"    [zstd]="-T0 -19 --long")
+declare -A ZIPEXTENSIONS=(       [gzip]="gz"   [xz]="xz"     [zstd]="zst"           )
+
+# Default state (so cleanup never references unset vars under set -u, if ever enabled)
+mountdir=""
+loopback=""
+src=""
+img=""
 
 function info() {
 	echo "$SCRIPTNAME: $1"
 }
 
 function error() {
-	echo -n "$SCRIPTNAME: ERROR occurred in line $1: "
+	echo -n "$SCRIPTNAME: ERROR occurred in line $1: " >&2
 	shift
-	echo "$@"
+	echo "$@" >&2
 }
 
 function cleanup() {
-	if losetup "$loopback" &>/dev/null; then
+	if [[ -n "$mountdir" ]] && mountpoint -q "$mountdir" 2>/dev/null; then
+		umount "$mountdir" 2>/dev/null || umount -l "$mountdir" 2>/dev/null || true
+	fi
+	if [[ -n "$mountdir" && -d "$mountdir" ]]; then
+		rmdir "$mountdir" 2>/dev/null || true
+	fi
+	if [[ -n "$loopback" ]] && losetup "$loopback" &>/dev/null; then
 		losetup -d "$loopback"
 	fi
-	if [ "$debug" = true ]; then
-		local old_owner=$(stat -c %u:%g "$src")
-		chown "$old_owner" "$LOGFILE"
+	if [[ "$debug" == true && -n "$src" && -f "$LOGFILE" ]]; then
+		local old_owner
+		old_owner=$(stat -c %u:%g "$src" 2>/dev/null) || return 0
+		chown "$old_owner" "$LOGFILE" 2>/dev/null || true
 	fi
-
 }
 
 function logVariables() {
-	if [ "$debug" = true ]; then
+	if [[ "$debug" == true ]]; then
 		echo "Line $1" >> "$LOGFILE"
 		shift
 		local v var
@@ -47,6 +81,17 @@ function logVariables() {
 			eval "v=\$$var"
 			echo "$var: $v" >> "$LOGFILE"
 		done
+	fi
+}
+
+function human_size() {
+	# Print file size in human-readable form using stat+numfmt.
+	# Falls back to du -h if numfmt is missing for any reason.
+	local f="$1"
+	if command -v numfmt >/dev/null 2>&1; then
+		numfmt --to=iec --suffix=B "$(stat -c %s "$f")"
+	else
+		du -h "$f" | awk '{print $1}'
 	fi
 }
 
@@ -61,62 +106,72 @@ function checkFilesystem() {
 	e2fsck -y "$loopback"
 	(( $? < 4 )) && return
 
-if [[ $repair == true ]]; then
-	info "Trying to recover corrupted filesystem - Phase 2"
-	e2fsck -fy -b 32768 "$loopback"
-	(( $? < 4 )) && return
-fi
+	if [[ "$repair" == true ]]; then
+		info "Trying to recover corrupted filesystem - Phase 2"
+		e2fsck -fy -b 32768 "$loopback"
+		(( $? < 4 )) && return
+	fi
 	error $LINENO "Filesystem recoveries failed. Giving up..."
 	exit 9
-
 }
 
 function set_autoexpand() {
-    #Make pi expand rootfs on next boot
-    mountdir=$(mktemp -d)
-    partprobe "$loopback"
-    sleep 3
-    umount "$loopback" > /dev/null 2>&1
-    mount "$loopback" "$mountdir" -o rw
-    if (( $? != 0 )); then
-      info "Unable to mount loopback, autoexpand will not be enabled"
-      return
-    fi
+	# Make Pi expand rootfs on next boot
+	mountdir=$(mktemp -d)
+	partprobe "$loopback" 2>/dev/null || true
+	command -v udevadm >/dev/null 2>&1 && udevadm settle || sleep 1
+	umount "$loopback" > /dev/null 2>&1 || true
 
-    if [ ! -d "$mountdir/etc" ]; then
-        info "/etc not found, autoexpand will not be enabled"
-        umount "$mountdir"
-        return
-    fi
+	if ! mount "$loopback" "$mountdir" -o rw; then
+		info "Unable to mount loopback, autoexpand will not be enabled"
+		return
+	fi
 
-    if [[ ! -f "$mountdir/etc/rc.local" ]]; then
-        info "An existing /etc/rc.local was not found, autoexpand may fail..."
-    fi
+	if [[ ! -d "$mountdir/etc" ]]; then
+		info "/etc not found, autoexpand will not be enabled"
+		umount "$mountdir"
+		return
+	fi
 
-    if ! grep -q "## PiShrink https://github.com/Drewsif/PiShrink ##" "$mountdir/etc/rc.local"; then
-      echo "Creating new /etc/rc.local"
-    if [ -f "$mountdir/etc/rc.local" ]; then
-        mv "$mountdir/etc/rc.local" "$mountdir/etc/rc.local.bak"
-    fi
+	if [[ ! -f "$mountdir/etc/rc.local" ]]; then
+		info "An existing /etc/rc.local was not found, autoexpand may fail..."
+	fi
+
+	if ! grep -q "## PiShrink https://github.com/Drewsif/PiShrink ##" "$mountdir/etc/rc.local" 2>/dev/null; then
+		echo "Creating new /etc/rc.local"
+		if [[ -f "$mountdir/etc/rc.local" ]]; then
+			mv "$mountdir/etc/rc.local" "$mountdir/etc/rc.local.bak"
+		fi
 
 cat <<'EOFRC' > "$mountdir/etc/rc.local"
 #!/bin/bash
 ## PiShrink https://github.com/Drewsif/PiShrink ##
 do_expand_rootfs() {
-  ROOT_PART=$(mount | sed -n 's|^/dev/\(.*\) on / .*|\1|p')
+  # Determine root device dynamically (works for mmcblk0p2, nvme0n1p2, sda2, ...)
+  ROOT_PART=$(findmnt -n -o SOURCE /)
+  ROOT_PART_NAME=${ROOT_PART#/dev/}
+  ROOT_DISK_NAME=$(lsblk -no PKNAME "$ROOT_PART" 2>/dev/null)
+  ROOT_DISK="/dev/${ROOT_DISK_NAME}"
 
-  PART_NUM=${ROOT_PART#mmcblk0p}
-  if [ "$PART_NUM" = "$ROOT_PART" ]; then
-    echo "$ROOT_PART is not an SD card. Don't know how to expand"
+  if [ -z "$ROOT_DISK_NAME" ]; then
+    echo "Could not determine root disk for $ROOT_PART. Giving up."
     return 0
   fi
 
-  # Get the starting offset of the root partition
-  PART_START=$(parted /dev/mmcblk0 -ms unit s p | grep "^${PART_NUM}" | cut -f 2 -d: | sed 's/[^0-9]//g')
-  [ "$PART_START" ] || return 1
-  # Return value will likely be error for fdisk as it fails to reload the
-  # partition table because the root fs is mounted
-  fdisk /dev/mmcblk0 <<EOF
+  # Partition number = trailing digits of the partition name
+  PART_NUM=$(echo "$ROOT_PART_NAME" | grep -oE '[0-9]+$')
+  if [ -z "$PART_NUM" ]; then
+    echo "Could not determine partition number from $ROOT_PART_NAME"
+    return 0
+  fi
+
+  # Prefer sfdisk if available (deterministic), otherwise fall back to fdisk heredoc.
+  if command -v sfdisk >/dev/null 2>&1; then
+    echo ",+" | sfdisk -N "$PART_NUM" "$ROOT_DISK" || true
+  else
+    PART_START=$(parted "$ROOT_DISK" -ms unit s p | grep "^${PART_NUM}:" | cut -f 2 -d: | sed 's/[^0-9]//g')
+    [ "$PART_START" ] || return 1
+    fdisk "$ROOT_DISK" <<EOF
 p
 d
 $PART_NUM
@@ -128,11 +183,12 @@ $PART_START
 p
 w
 EOF
+  fi
 
 cat <<EOF > /etc/rc.local &&
 #!/bin/sh
-echo "Expanding /dev/$ROOT_PART"
-resize2fs /dev/$ROOT_PART
+echo "Expanding $ROOT_PART"
+resize2fs $ROOT_PART
 rm -f /etc/rc.local; cp -fp /etc/rc.local.bak /etc/rc.local && /etc/rc.local
 
 EOF
@@ -140,14 +196,14 @@ reboot
 exit
 }
 raspi_config_expand() {
-/usr/bin/env raspi-config --expand-rootfs
-if [[ $? != 0 ]]; then
-  return -1
-else
-  rm -f /etc/rc.local; cp -fp /etc/rc.local.bak /etc/rc.local && /etc/rc.local
-  reboot
-  exit
-fi
+  /usr/bin/env raspi-config --expand-rootfs
+  if [[ $? != 0 ]]; then
+    return 1
+  else
+    rm -f /etc/rc.local; cp -fp /etc/rc.local.bak /etc/rc.local && /etc/rc.local
+    reboot
+    exit
+  fi
 }
 raspi_config_expand
 echo "WARNING: Using backup expand..."
@@ -162,15 +218,15 @@ fi
 exit 0
 EOFRC
 
-    chmod +x "$mountdir/etc/rc.local"
-    fi
-    umount "$mountdir"
+		chmod +x "$mountdir/etc/rc.local"
+	fi
+	umount "$mountdir"
 }
 
 help() {
 	local help
 	read -r -d '' help << EOM
-Usage: $0 [-adhnrsvzZ] imagefile.img [newimagefile.img]
+Usage: $0 [-adhnrsvzZS] imagefile.img [newimagefile.img]
 
   -s         Don't expand filesystem when image is booted the first time
   -v         Be verbose
@@ -178,6 +234,7 @@ Usage: $0 [-adhnrsvzZ] imagefile.img [newimagefile.img]
   -r         Use advanced filesystem repair option if the normal one fails
   -z         Compress image after shrinking with gzip
   -Z         Compress image after shrinking with xz
+  -S         Compress image after shrinking with zstd
   -a         Compress image in parallel using multiple cores
   -d         Write debug messages in a debug log file
 EOM
@@ -193,45 +250,51 @@ parallel=false
 verbose=false
 ziptool=""
 
-while getopts ":adnhrsvzZ" opt; do
+while getopts ":adnhrsvzZS" opt; do
   case "${opt}" in
-    a) parallel=true;;
-    d) debug=true;;
-    n) update_check=false;;
-    h) help;;
-    r) repair=true;;
+    a) parallel=true ;;
+    d) debug=true ;;
+    n) update_check=false ;;
+    h) help ;;
+    r) repair=true ;;
     s) should_skip_autoexpand=true ;;
-    v) verbose=true;;
-    z) ziptool="gzip";;
-    Z) ziptool="xz";;
-    *) help;;
+    v) verbose=true ;;
+    z) ziptool="gzip" ;;
+    Z) ziptool="xz" ;;
+    S) ziptool="zstd" ;;
+    \?) error $LINENO "Unknown option: -$OPTARG"; help ;;
+    *) help ;;
   esac
 done
 shift $((OPTIND-1))
 
-if [ "$debug" = true ]; then
+if [[ "$debug" == true ]]; then
 	info "Creating log file $LOGFILE"
-	rm "$LOGFILE" &>/dev/null
+	rm -f "$LOGFILE" &>/dev/null || true
 	exec 1> >(stdbuf -i0 -o0 -e0 tee -a "$LOGFILE" >&1)
 	exec 2> >(stdbuf -i0 -o0 -e0 tee -a "$LOGFILE" >&2)
 fi
 
 echo -e "PiShrink $version - https://github.com/Drewsif/PiShrink\n"
 
-# Try and check for updates
+# Try to check for updates
 if $update_check; then
-  latest_release=$(curl -m 5 https://api.github.com/repos/Drewsif/PiShrink/releases/latest 2>/dev/null | grep -i "tag_name" 2>/dev/null | awk -F '"' '{print $4}' 2>/dev/null)
-  if [[ $? ]] && [ "$latest_release" \> "$version" ]; then
-    echo "WARNING: You do not appear to be running the latest version of PiShrink. Head on over to https://github.com/Drewsif/PiShrink to grab $latest_release"
-    echo ""
+  if command -v curl >/dev/null 2>&1; then
+    latest_release=$(curl -fsSL -m 5 https://api.github.com/repos/Drewsif/PiShrink/releases/latest 2>/dev/null \
+                     | grep -i '"tag_name"' \
+                     | awk -F '"' '{print $4}')
+    if [[ -n "$latest_release" && "$latest_release" > "$version" ]]; then
+      echo "WARNING: You do not appear to be running the latest version of PiShrink. Head over to https://github.com/Drewsif/PiShrink to grab $latest_release"
+      echo ""
+    fi
   fi
 fi
 
-#Args
+# Args
 src="$1"
 img="$1"
 
-#Usage checks
+# Usage checks
 if [[ -z "$img" ]]; then
   help
 fi
@@ -245,45 +308,42 @@ if (( EUID != 0 )); then
   exit 3
 fi
 
-# set locale to POSIX(English) temporarily
-# these locale settings only affect the script and its sub processes
-
+# Set locale to POSIX(English) temporarily.
+# These locale settings only affect the script and its sub-processes.
 export LANGUAGE=POSIX
 export LC_ALL=POSIX
 export LANG=POSIX
 
-# check selected compression tool is supported and installed
-if [[ -n $ziptool ]]; then
-	if [[ ! " ${ZIPTOOLS[*]} " =~ $ziptool ]]; then
+# Check selected compression tool is supported and add its binary to REQUIRED_TOOLS
+if [[ -n "$ziptool" ]]; then
+	if [[ ! " ${ZIPTOOLS[*]} " =~ \ ${ziptool}\  ]]; then
 		error $LINENO "$ziptool is an unsupported ziptool."
 		exit 17
+	fi
+	if [[ "$parallel" == true ]]; then
+		REQUIRED_TOOLS+=( "${ZIP_PARALLEL_TOOL[$ziptool]}" )
 	else
-		if [[ $parallel == true && $ziptool == "gzip" ]]; then
-			REQUIRED_TOOLS="$REQUIRED_TOOLS pigz"
-		else
-			REQUIRED_TOOLS="$REQUIRED_TOOLS $ziptool"
-		fi
+		REQUIRED_TOOLS+=( "$ziptool" )
 	fi
 fi
 
-#Check that what we need is installed
-for command in $REQUIRED_TOOLS; do
-  command -v $command >/dev/null 2>&1
-  if (( $? != 0 )); then
-    error $LINENO "$command is not installed."
+# Check that what we need is installed
+for cmd in "${REQUIRED_TOOLS[@]}"; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    error $LINENO "$cmd is not installed."
     exit 4
   fi
 done
 
-#Copy to new file if requested
-if [ -n "$2" ]; then
+# Copy to new file if requested
+if [[ -n "$2" ]]; then
   f="$2"
-  if [[ -n $ziptool && "${f##*.}" == "${ZIPEXTENSIONS[$ziptool]}" ]]; then	# remove zip extension if zip requested because zip tool will complain about extension
+  if [[ -n "$ziptool" && "${f##*.}" == "${ZIPEXTENSIONS[$ziptool]}" ]]; then
+    # Remove zip extension if compression requested; the zip tool would otherwise complain.
     f="${f%.*}"
   fi
   info "Copying $1 to $f..."
-  cp --reflink=auto --sparse=always "$1" "$f"
-  if (( $? != 0 )); then
+  if ! cp --reflink=auto --sparse=always "$1" "$f"; then
     error $LINENO "Could not copy file..."
     exit 5
   fi
@@ -292,50 +352,55 @@ if [ -n "$2" ]; then
   img="$f"
 fi
 
-# cleanup at script exit
+# Cleanup at script exit
 trap cleanup EXIT
 
-#Gather info
+# Gather info
 info "Gathering data"
-beforesize="$(ls -lh "$img" | cut -d ' ' -f 5)"
-parted_output="$(parted -ms "$img" unit B print)"
-rc=$?
-if (( $rc )); then
+beforesize="$(human_size "$img")"
+if ! parted_output="$(parted -ms "$img" unit B print)"; then
+	rc=$?
 	error $LINENO "parted failed with rc $rc"
 	info "Possibly invalid image. Run 'parted $img unit B print' manually to investigate"
 	exit 6
 fi
 partnum="$(echo "$parted_output" | tail -n 1 | cut -d ':' -f 1)"
 partstart="$(echo "$parted_output" | tail -n 1 | cut -d ':' -f 2 | tr -d 'B')"
-if [ -z "$(parted -s "$img" unit B print | grep "$partstart" | grep logical)" ]; then
-    parttype="primary"
-else
+
+# Single-pass detection of primary vs. logical partition
+if parted -s "$img" unit B print | awk -v ps="$partstart" '$0 ~ ps && /logical/ {found=1} END {exit !found}'; then
     parttype="logical"
+else
+    parttype="primary"
 fi
-loopback="$(losetup -f --show -o "$partstart" "$img")"
-tune2fs_output="$(tune2fs -l "$loopback")"
-rc=$?
-if (( $rc )); then
-    echo "$tune2fs_output"
-    error $LINENO "tune2fs failed. Unable to shrink this type of image"
-    exit 7
+
+if ! loopback="$(losetup -f --show -o "$partstart" "$img")"; then
+	error $LINENO "losetup failed"
+	exit 6
+fi
+
+if ! tune2fs_output="$(tune2fs -l "$loopback")"; then
+	rc=$?
+	echo "$tune2fs_output"
+	error $LINENO "tune2fs failed with rc $rc. Unable to shrink this type of image"
+	exit 7
 fi
 
 currentsize="$(echo "$tune2fs_output" | grep '^Block count:' | tr -d ' ' | cut -d ':' -f 2)"
-blocksize="$(echo "$tune2fs_output" | grep '^Block size:' | tr -d ' ' | cut -d ':' -f 2)"
+blocksize="$(echo "$tune2fs_output" | grep '^Block size:'  | tr -d ' ' | cut -d ':' -f 2)"
 
 logVariables $LINENO beforesize parted_output partnum partstart parttype tune2fs_output currentsize blocksize
 
-#Check if we should make pi expand rootfs on next boot
-if [ "$parttype" == "logical" ]; then
+# Check if we should make Pi expand rootfs on next boot
+if [[ "$parttype" == "logical" ]]; then
   echo "WARNING: PiShrink does not yet support autoexpanding of this type of image"
-elif [ "$should_skip_autoexpand" = false ]; then
+elif [[ "$should_skip_autoexpand" == false ]]; then
   set_autoexpand
 else
   echo "Skipping autoexpanding process..."
 fi
 
-#Make sure filesystem is ok
+# Make sure filesystem is OK
 checkFilesystem
 
 if ! minsize=$(resize2fs -P "$loopback"); then
@@ -345,60 +410,61 @@ if ! minsize=$(resize2fs -P "$loopback"); then
 fi
 minsize=$(cut -d ':' -f 2 <<< "$minsize" | tr -d ' ')
 logVariables $LINENO currentsize minsize
-if [[ $currentsize -eq $minsize ]]; then
+if [[ "$currentsize" -eq "$minsize" ]]; then
   info "Filesystem already shrunk to smallest size. Skipping filesystem shrinking"
 else
-  #Add some free space to the end of the filesystem
-  extra_space=$(($currentsize - $minsize))
+  # Add some free space to the end of the filesystem
+  extra_space=$((currentsize - minsize))
   logVariables $LINENO extra_space
   for space in 5000 1000 100; do
-    if [[ $extra_space -gt $space ]]; then
-      minsize=$(($minsize + $space))
+    if (( extra_space > space )); then
+      minsize=$((minsize + space))
       break
     fi
   done
   logVariables $LINENO minsize
 
-  #Shrink filesystem
+  # Shrink filesystem
   info "Shrinking filesystem"
-  if [ -z "$mountdir" ]; then
+  if [[ -z "$mountdir" ]]; then
     mountdir=$(mktemp -d)
   fi
 
-  resize2fs -p "$loopback" $minsize
-  rc=$?
-  if (( $rc )); then
+  if ! resize2fs -p "$loopback" "$minsize"; then
+    rc=$?
     error $LINENO "resize2fs failed with rc $rc"
-    mount "$loopback" "$mountdir"
-    mv "$mountdir/etc/rc.local.bak" "$mountdir/etc/rc.local"
-    umount "$mountdir"
+    mount "$loopback" "$mountdir" 2>/dev/null \
+      && mv "$mountdir/etc/rc.local.bak" "$mountdir/etc/rc.local" 2>/dev/null \
+      && umount "$mountdir"
     losetup -d "$loopback"
     exit 12
-  else
-    info "Zeroing any free space left"
-    mount "$loopback" "$mountdir"
-    cat /dev/zero > "$mountdir/PiShrink_zero_file" 2>/dev/null
-    info "Zeroed $(ls -lh "$mountdir/PiShrink_zero_file" | cut -d ' ' -f 5)"
-    rm -f "$mountdir/PiShrink_zero_file"
-    umount "$mountdir"
   fi
-  sleep 1
 
-  #Shrink partition
+  info "Zeroing any free space left"
+  mount "$loopback" "$mountdir"
+  cat /dev/zero > "$mountdir/PiShrink_zero_file" 2>/dev/null || true
+  if [[ -f "$mountdir/PiShrink_zero_file" ]]; then
+    info "Zeroed $(human_size "$mountdir/PiShrink_zero_file")"
+    rm -f "$mountdir/PiShrink_zero_file"
+  fi
+  umount "$mountdir"
+
+  command -v udevadm >/dev/null 2>&1 && udevadm settle || sleep 1
+
+  # Shrink partition
   info "Shrinking partition"
-  partnewsize=$(($minsize * $blocksize))
-  newpartend=$(($partstart + $partnewsize))
+  partnewsize=$((minsize * blocksize))
+  newpartend=$((partstart + partnewsize))
   logVariables $LINENO partnewsize newpartend
-  parted -s -a minimal "$img" rm "$partnum"
-  rc=$?
-  if (( $rc )); then
+
+  if ! parted -s -a minimal "$img" rm "$partnum"; then
+    rc=$?
     error $LINENO "parted failed with rc $rc"
     exit 13
   fi
 
-  parted -s "$img" unit B mkpart "$parttype" "$partstart" "$newpartend"
-  rc=$?
-  if (( $rc )); then
+  if ! parted -s "$img" unit B mkpart "$parttype" "$partstart" "$newpartend"; then
+    rc=$?
     error $LINENO "parted failed with rc $rc"
     exit 14
   fi
@@ -406,55 +472,59 @@ fi
 
 # Truncate the image file
 info "Checking for unpartitioned space"
-endresult=$(parted -ms "$img" unit B print free)
-rc=$?
-if (( $rc )); then
+if ! endresult=$(parted -ms "$img" unit B print free); then
+  rc=$?
   error $LINENO "parted failed with rc $rc"
   exit 15
 fi
 
 endresult_last=$(tail -1 <<< "$endresult")
 if [[ "$endresult_last" == *free\; ]]; then
-  info "Truncating image"
   endresult=$(cut -d ':' -f 2 <<< "$endresult_last" | tr -d 'B')
-  logVariables $LINENO endresult
-  truncate -s "$endresult" "$img"
-  rc=$?
-  if (( $rc )); then
-    error $LINENO "truncate failed with rc $rc"
-    exit 16
+  current_bytes=$(stat -c %s "$img")
+  logVariables $LINENO endresult current_bytes
+  if (( endresult < current_bytes )); then
+    info "Truncating image"
+    if ! truncate -s "$endresult" "$img"; then
+      rc=$?
+      error $LINENO "truncate failed with rc $rc"
+      exit 16
+    fi
+  else
+    info "No truncation needed (endresult >= current size)"
   fi
 fi
 
-# handle compression
-if [[ -n $ziptool ]]; then
+# Handle compression
+if [[ -n "$ziptool" ]]; then
 	options=""
-	envVarname="${MYNAME^^}_${ziptool^^}" # PISHRINK_GZIP or PISHRINK_XZ environment variables allow to override all options for gzip or xz
-	[[ $parallel == true ]] && options="${ZIP_PARALLEL_OPTIONS[$ziptool]}"
-	[[ -v $envVarname ]] && options="${!envVarname}" # if environment variable defined use these options
-	[[ $verbose == true ]] && options="$options -v" # add verbose flag if requested
+	envVarname="${MYNAME^^}_${ziptool^^}" # e.g. PISHRINK_GZIP / PISHRINK_XZ / PISHRINK_ZSTD
+	[[ "$parallel" == true ]] && options="${ZIP_PARALLEL_OPTIONS[$ziptool]}"
+	[[ -v $envVarname ]] && options="${!envVarname}"
+	[[ "$verbose" == true ]] && options="$options -v"
 
-	if [[ $parallel == true ]]; then
+	if [[ "$parallel" == true ]]; then
 		parallel_tool="${ZIP_PARALLEL_TOOL[$ziptool]}"
 		info "Using $parallel_tool on the shrunk image"
-		if ! $parallel_tool ${options} "$img"; then
+		# shellcheck disable=SC2086
+		if ! $parallel_tool $options "$img"; then
 			rc=$?
 			error $LINENO "$parallel_tool failed with rc $rc"
 			exit 18
 		fi
-
-	else # sequential
+	else
 		info "Using $ziptool on the shrunk image"
-		if ! $ziptool ${options} "$img"; then
+		# shellcheck disable=SC2086
+		if ! $ziptool $options "$img"; then
 			rc=$?
 			error $LINENO "$ziptool failed with rc $rc"
 			exit 19
 		fi
 	fi
-	img=$img.${ZIPEXTENSIONS[$ziptool]}
+	img="$img.${ZIPEXTENSIONS[$ziptool]}"
 fi
 
-aftersize=$(ls -lh "$img" | cut -d ' ' -f 5)
+aftersize=$(human_size "$img")
 logVariables $LINENO aftersize
 
 finishSeconds=$SECONDS
